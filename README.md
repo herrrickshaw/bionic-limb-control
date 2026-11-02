@@ -1,31 +1,107 @@
 # EMG decoding for bionic-limb control
 
-`emg_decoder.py` is a single-file reference pipeline that turns surface EMG (sEMG) from forearm muscles into prosthetic-hand commands.
+A single-file Python reference pipeline that turns surface EMG (sEMG) from forearm
+muscles into prosthetic-hand commands. It implements the two control schemes used in
+real myoelectric prostheses — two-site direct control and multi-channel pattern
+recognition — and evaluates them offline (leave-repetitions-out) and in a causal
+online replay. Input is a CSV recording (or built-in synthetic data); output is a
+printed classification report, confusion matrix, mean-frequency check and a stream
+of `Command(gesture, speed, confidence)` objects you can map to actuator targets.
 
+> Status: research-only prototype. The bundled demo runs on synthetic data; no real
+> amputee or hardware recordings are included. Not a medical device.
+
+## What it does
+- Band-pass (20–450 Hz, 4th-order Butterworth) + mains-notch (fundamental and two harmonics) filtering, zero-phase offline (`preprocess`) and stateful causal for streaming (`CausalFilter`).
+- Sliding 200 ms / 50 ms windows with the Hudgins time-domain feature set (MAV, RMS, WL, ZC, SSC) plus log-variance (`td_features`, `extract`).
+- `PatternRecognitionDecoder`: StandardScaler → LDA classifier, 5-window majority vote and proportional speed from normalised MAV (rest → MVC).
+- `DirectControl`: two-electrode scheme — flexor closes, extensor opens, co-contraction cycles through five grip patterns with a refractory period.
+- Leakage-free evaluation (`evaluate`, `split_by_rep`): trains on early repetitions and tests on the last two; prints per-class report, confusion matrix and per-channel mean frequency.
+- `synthesize`: seeded synthetic 8-channel sEMG with mains hum, motion artefact and rep-to-rep drift for testing without hardware.
+
+## Quick start
 ```bash
-pip install numpy scipy scikit-learn
+git clone https://github.com/herrrickshaw/bionic-limb-control.git
+cd bionic-limb-control
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
 python emg_decoder.py --demo                               # synthetic 8-channel data
 python emg_decoder.py --csv rec.csv --fs 2000 --mains 50   # your own recording
 ```
 
-CSV format: one row per sample, one column per channel, plus optional `label` (int, 0 = rest) and `rep` (repetition index) columns.
+CSV format: one row per sample, one column per channel, plus optional `label`
+(int, 0 = rest) and `rep` (repetition index) columns. Columns named `time` /
+`timestamp` are ignored. Without `label` the tool prints per-channel RMS and mean
+frequency only; without `rep` the recording is split into five contiguous fifths.
 
-## What it does
+## How it works
 
-| Stage | Choice | Why |
+| Stage | Choice | Module symbol | Why |
+|---|---|---|---|
+| Filter | 4th-order Butterworth 20–450 Hz + mains notch (×3 harmonics) | `design_filters`, `preprocess`, `CausalFilter` | Removes motion artefact and power-line hum. Offline uses `sosfiltfilt`; on the device, `CausalFilter` keeps filter state between chunks. |
+| Window | 200 ms window, 50 ms step | `sliding_windows`, `extract` | Keeps controller delay under the ~300 ms users can tolerate. |
+| Features | Hudgins TD set (MAV, RMS, WL, ZC, SSC) + log-variance; spectral mean frequency for fatigue checks | `td_features`, `mean_frequency` | The standard set for clinical pattern recognition. Cheap enough for a microcontroller. |
+| Classifier | StandardScaler → LDA | `PatternRecognitionDecoder.fit` | Used by Coapt and most PR systems in the literature. Fast, and it needs little training data. |
+| Post-processing | 5-window majority vote + proportional speed from normalised MAV (rest → MVC) | `PatternRecognitionDecoder.stream` / `_decide` | Stops the hand chattering between classes and gives velocity control. |
+| Direct control | 2 electrodes. Flexor closes, extensor opens, co-contraction cycles the grip. | `DirectControl` | The scheme used by Open Bionics Hero and most commercial hands. |
+
+**Evaluation trains on early repetitions and tests on later ones.** Splitting
+overlapping windows at random leaks neighbouring windows into the test set and
+inflates accuracy by 10–20 points. Many GitHub EMG projects make this mistake.
+
+Demo results (synthetic data, so they are optimistic; `python emg_decoder.py --demo`,
+seed 0): 97.2% offline window accuracy across 6 classes, and 88.2% agreement in a
+causal online replay. The online gap comes mostly from the ~250 ms vote-smoothing
+lag at gesture transitions. Expect 75–90% offline on real amputee data, and lower
+across sessions unless you recalibrate.
+
+All tunable defaults (sampling rate, mains frequency, pass-band, window/step,
+vote depth, zero-crossing dead-band, held-out repetitions) are named constants at
+the top of `emg_decoder.py` and are also parameters of the relevant functions.
+
+## Repository layout
+| Path | Purpose |
+|---|---|
+| `emg_decoder.py` | The whole pipeline: filters, features, decoder, direct control, synthetic data, evaluation, CLI |
+| `tests/` | pytest suite (pure-function unit tests, end-to-end characterisation on synthetic data, CLI smoke tests) |
+| `requirements.txt` | Runtime dependencies (numpy, scipy, scikit-learn) |
+| `pyproject.toml` | Package metadata, ruff and pytest configuration |
+| `.github/workflows/ci.yml` | Lint + tests on push and pull request (Python 3.9 and 3.12) |
+
+No data files are tracked; `*.csv` is gitignored.
+
+## Configuration
+Everything is a CLI flag or a function argument — there are no environment
+variables, config files or secrets.
+
+| Flag | Default | Meaning |
 |---|---|---|
-| Filter | 4th-order Butterworth 20–450 Hz + mains notch (×3 harmonics) | Removes motion artefact and power-line hum. Offline uses `sosfiltfilt`; on the device, `CausalFilter` keeps filter state between chunks. |
-| Window | 200 ms window, 50 ms step | Keeps controller delay under the ~300 ms users can tolerate. |
-| Features | Hudgins TD set (MAV, RMS, WL, ZC, SSC) + log-variance; spectral mean frequency for fatigue checks | The standard set for clinical pattern recognition. Cheap enough for a microcontroller. |
-| Classifier | StandardScaler → LDA | Used by Coapt and most PR systems in the literature. Fast, and it needs little training data. |
-| Post-processing | 5-window majority vote + proportional speed from normalised MAV (rest → MVC) | Stops the hand chattering between classes and gives velocity control. |
-| Direct control | `DirectControl`: 2 electrodes. Flexor closes, extensor opens, co-contraction cycles the grip. | The scheme used by Open Bionics Hero and most commercial hands. |
+| `--demo` | off | Run on synthetic data (also the default when `--csv` is absent) |
+| `--csv PATH` | — | Recording to analyse |
+| `--fs` | 2000 | Sampling rate in Hz |
+| `--mains` | 50 | Power-line frequency: 50 (India/EU) or 60 (US) |
 
-**Evaluation trains on early repetitions and tests on later ones.** Splitting overlapping windows at random leaks neighbouring windows into the test set and inflates accuracy by 10–20 points. Many GitHub EMG projects make this mistake.
+## Testing
+```bash
+pip install pytest ruff
+ruff check .
+pytest -q
+```
 
-Demo results (synthetic data, so they are optimistic): 97.2% offline window accuracy across 6 classes, and 89% agreement in a causal online replay. The online gap comes mostly from the ~250 ms vote-smoothing lag at gesture transitions. Expect 75–90% offline on real amputee data, and lower across sessions unless you recalibrate.
+## Limitations and known issues
+- Demo accuracy is measured on synthetic data and is optimistic; real sEMG, especially across sessions or on amputee data, will score lower.
+- `PatternRecognitionDecoder.stream` emits one `Command` per `step_ms` of input, including `win_ms / step_ms` decisions on the very first full buffer; downstream code should treat the first ~200 ms as warm-up.
+- Only LDA is implemented; there is no cross-user or cross-session adaptation.
+- The code never touches hardware. Before attaching anything to a person, enforce current limits, end-stops and a watchdog in firmware, independent of this code.
+- Not a medical device.
 
-## Similar open-source projects
+### Suggested path to real hardware
+1. Record from 2–8 electrodes with a BioAmp/OpenBCI/Myo board through BrainFlow. Log the data to CSV with `label` and `rep` columns (about 5 reps × 3 s per gesture).
+2. Run `--csv` to check accuracy and mean frequency. Mean frequency should be about 60–120 Hz on real muscle. A value near 50/60 Hz means hum is leaking through the notch.
+3. Feed live chunks into `PatternRecognitionDecoder.stream()` and map each `Command(gesture, speed)` to servo targets.
+4. Before attaching anything to a person, enforce current limits, end-stops and a watchdog in firmware, independent of this code.
+
+## Related open-source projects
 
 Star counts were taken from GitHub on 2026-10-25.
 
@@ -72,10 +148,5 @@ Star counts were taken from GitHub on 2026-10-25.
 | [tsagkas/sEMG-HandGestureRecognition](https://github.com/tsagkas/sEMG-HandGestureRecognition) | 134 | CNNs on NinaPro. |
 | [MIC-Laboratory/Real-time-Bionic-Arm-Control-via-CNN-on-Sony-Spresense](https://github.com/MIC-Laboratory/Real-time-Bionic-Arm-Control-via-CNN-on-Sony-Spresense) | 15 | Embedded CNN running on a microcontroller. |
 
-## Suggested path to real hardware
-1. Record from 2–8 electrodes with a BioAmp/OpenBCI/Myo board through BrainFlow. Log the data to CSV with `label` and `rep` columns (about 5 reps × 3 s per gesture).
-2. Run `--csv` to check accuracy and mean frequency. Mean frequency should be about 60–120 Hz on real muscle. A value near 50/60 Hz means hum is leaking through the notch.
-3. Feed live chunks into `PatternRecognitionDecoder.stream()` and map each `Command(gesture, speed)` to servo targets.
-4. Before attaching anything to a person, enforce current limits, end-stops and a watchdog in firmware, independent of this code.
-
-Not a medical device.
+## Licence
+No licence file yet — all rights reserved.
