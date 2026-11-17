@@ -26,7 +26,9 @@ limits (current, end-stops, watchdog) independent of this software.
 from __future__ import annotations
 
 import argparse
+import csv
 from collections import Counter, deque
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 
 import numpy as np
@@ -38,23 +40,49 @@ from sklearn.preprocessing import StandardScaler
 
 GESTURES = ["rest", "power_grip", "open_hand", "pinch", "point", "wrist_pronate"]
 
+# --------------------------------------------------------------------------- #
+# Defaults (units in the name; all tunable per call)
+# --------------------------------------------------------------------------- #
+DEFAULT_FS = 2000.0            # Hz, sampling rate
+DEFAULT_MAINS = 50.0           # Hz, power-line frequency (50 India/EU, 60 US)
+DEFAULT_BAND = (20.0, 450.0)   # Hz, sEMG pass-band
+MAX_PASSBAND_FRACTION = 0.45   # upper band edge is capped at this fraction of fs
+NOTCH_Q = 30                   # quality factor of each mains notch
+NOTCH_HARMONICS = 3            # notch the fundamental and the next two harmonics
+DEFAULT_WIN_MS = 200           # analysis window; keeps controller delay < ~300 ms
+DEFAULT_STEP_MS = 50           # window hop
+DEFAULT_VOTE = 5               # majority-vote depth in windows (~250 ms lag)
+DEFAULT_ZC_THRESH = 0.01       # ZC/SSC dead-band, ~resting noise amplitude
+N_TEST_REPS = 2                # repetitions held out for evaluation
+MEAN_FREQ_NPERSEG = 256        # Welch segment length for mean frequency
+
+
+def samples(fs: float, ms: float) -> int:
+    """Number of samples in `ms` milliseconds at `fs` Hz (truncated)."""
+    return int(fs * ms / 1000)
+
+
+def gesture_name(cls: int) -> str:
+    """Human-readable name for an integer class id; unknown ids print as digits."""
+    return GESTURES[cls] if cls < len(GESTURES) else str(cls)
+
 
 # --------------------------------------------------------------------------- #
 # Pre-processing
 # --------------------------------------------------------------------------- #
-def design_filters(fs: float, band=(20.0, 450.0), mains=50.0):
-    """Band-pass (removes motion artefact <20 Hz) + mains notch and its harmonics."""
-    hi = min(band[1], 0.45 * fs)
+def design_filters(fs: float, band: tuple[float, float] = DEFAULT_BAND, mains: float = DEFAULT_MAINS) -> np.ndarray:
+    """Band-pass (removes motion artefact <20 Hz) + mains notch and its harmonics, as one SOS array."""
+    hi = min(band[1], MAX_PASSBAND_FRACTION * fs)
     sos = [signal.butter(4, [band[0], hi], btype="band", fs=fs, output="sos")]
-    for h in range(1, 4):
+    for h in range(1, NOTCH_HARMONICS + 1):
         f0 = mains * h
         if f0 < hi:
-            b, a = signal.iirnotch(f0, Q=30, fs=fs)
+            b, a = signal.iirnotch(f0, Q=NOTCH_Q, fs=fs)
             sos.append(signal.tf2sos(b, a))
     return np.vstack(sos)
 
 
-def preprocess(x: np.ndarray, fs: float, mains=50.0) -> np.ndarray:
+def preprocess(x: np.ndarray, fs: float, mains: float = DEFAULT_MAINS) -> np.ndarray:
     """Zero-phase filtering for offline analysis. x: (n_samples, n_channels)."""
     return signal.sosfiltfilt(design_filters(fs, mains=mains), x, axis=0)
 
@@ -62,7 +90,7 @@ def preprocess(x: np.ndarray, fs: float, mains=50.0) -> np.ndarray:
 class CausalFilter:
     """Stateful causal filter for streaming use (filtfilt is not causal)."""
 
-    def __init__(self, fs: float, n_ch: int, mains=50.0):
+    def __init__(self, fs: float, n_ch: int, mains: float = DEFAULT_MAINS):
         self.sos = design_filters(fs, mains=mains)
         self.zi = np.zeros((self.sos.shape[0], 2, n_ch))
 
@@ -74,11 +102,12 @@ class CausalFilter:
 # --------------------------------------------------------------------------- #
 # Features
 # --------------------------------------------------------------------------- #
-def td_features(win: np.ndarray, thresh: float = 0.01) -> np.ndarray:
+def td_features(win: np.ndarray, thresh: float = DEFAULT_ZC_THRESH) -> np.ndarray:
     """Hudgins time-domain set per channel: MAV, RMS, WL, ZC, SSC (+ log-var).
 
     win: (n_samples, n_channels). `thresh` suppresses noise-driven ZC/SSC
     counts and should be on the order of the resting noise amplitude.
+    Returns a flat vector of length 6 * n_channels, feature-major.
     """
     d = np.diff(win, axis=0)
     mav = np.mean(np.abs(win), axis=0)
@@ -91,19 +120,29 @@ def td_features(win: np.ndarray, thresh: float = 0.01) -> np.ndarray:
 
 
 def mean_frequency(win: np.ndarray, fs: float) -> np.ndarray:
-    """Per-channel spectral mean frequency — drops as muscles fatigue."""
-    f, p = signal.welch(win, fs=fs, nperseg=min(256, len(win)), axis=0)
+    """Per-channel spectral mean frequency (Hz) — drops as muscles fatigue."""
+    f, p = signal.welch(win, fs=fs, nperseg=min(MEAN_FREQ_NPERSEG, len(win)), axis=0)
     return (f[:, None] * p).sum(0) / (p.sum(0) + 1e-12)
 
 
-def sliding_windows(n: int, fs: float, win_ms=200, step_ms=50):
-    """Yield (start, stop). 200 ms keeps controller delay under ~300 ms."""
-    w, s = int(fs * win_ms / 1000), int(fs * step_ms / 1000)
+def sliding_windows(
+    n: int, fs: float, win_ms: int = DEFAULT_WIN_MS, step_ms: int = DEFAULT_STEP_MS
+) -> Iterator[tuple[int, int]]:
+    """Yield (start, stop) sample indices of consecutive windows over `n` samples."""
+    w, s = samples(fs, win_ms), samples(fs, step_ms)
     for start in range(0, n - w + 1, s):
         yield start, start + w
 
 
-def extract(x, fs, labels=None, reps=None, win_ms=200, step_ms=50, thresh=0.01):
+def extract(
+    x: np.ndarray,
+    fs: float,
+    labels: np.ndarray | None = None,
+    reps: np.ndarray | None = None,
+    win_ms: int = DEFAULT_WIN_MS,
+    step_ms: int = DEFAULT_STEP_MS,
+    thresh: float = DEFAULT_ZC_THRESH,
+) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None]:
     """Windowed features; each window takes the label/rep at its last sample."""
     feats, y, r = [], [], []
     for a, b in sliding_windows(len(x), fs, win_ms, step_ms):
@@ -126,19 +165,30 @@ class Command:
 
 
 class PatternRecognitionDecoder:
-    def __init__(self, fs: float, n_ch: int, mains=50.0, win_ms=200, step_ms=50, vote=5):
+    """Filter -> window -> Hudgins features -> StandardScaler+LDA -> majority vote."""
+
+    def __init__(
+        self,
+        fs: float,
+        n_ch: int,
+        mains: float = DEFAULT_MAINS,
+        win_ms: int = DEFAULT_WIN_MS,
+        step_ms: int = DEFAULT_STEP_MS,
+        vote: int = DEFAULT_VOTE,
+    ):
         self.fs, self.n_ch, self.mains = fs, n_ch, mains
         self.win_ms, self.step_ms = win_ms, step_ms
         self.model = make_pipeline(StandardScaler(), LinearDiscriminantAnalysis())
-        self.thresh = 0.01
-        self.rest_mav = None
-        self.mvc_mav = None
+        self.thresh = DEFAULT_ZC_THRESH
+        self.rest_mav: float | None = None
+        self.mvc_mav: float | None = None
         self._votes: deque = deque(maxlen=vote)
 
     # -- training -------------------------------------------------------------
-    def fit(self, x_filt, labels):
+    def fit(self, x_filt: np.ndarray, labels: np.ndarray) -> PatternRecognitionDecoder:
+        """Fit on filtered samples (n, n_ch) with per-sample integer labels (0 = rest)."""
         rest = x_filt[labels == 0]
-        self.thresh = 3 * np.std(rest) if len(rest) else 0.01
+        self.thresh = 3 * np.std(rest) if len(rest) else DEFAULT_ZC_THRESH
         X, y, _ = extract(x_filt, self.fs, labels, None, self.win_ms, self.step_ms, self.thresh)
         self.model.fit(X, y)
         mav = X[:, : self.n_ch].mean(1)
@@ -146,16 +196,17 @@ class PatternRecognitionDecoder:
         self.mvc_mav = np.percentile(mav[y != 0], 95) if np.any(y != 0) else 1.0
         return self
 
-    def predict_windows(self, x_filt):
+    def predict_windows(self, x_filt: np.ndarray) -> np.ndarray:
+        """Class id per window of an already-filtered recording."""
         X, _, _ = extract(x_filt, self.fs, None, None, self.win_ms, self.step_ms, self.thresh)
         return self.model.predict(X)
 
     # -- online ---------------------------------------------------------------
-    def stream(self, raw_chunks):
+    def stream(self, raw_chunks: Iterable[np.ndarray]) -> Iterator[Command]:
         """Consume raw (n, n_ch) chunks; yield a Command every step_ms."""
         filt = CausalFilter(self.fs, self.n_ch, self.mains)
-        w = int(self.fs * self.win_ms / 1000)
-        s = int(self.fs * self.step_ms / 1000)
+        w = samples(self.fs, self.win_ms)
+        s = samples(self.fs, self.step_ms)
         buf = np.zeros((0, self.n_ch))
         pending = 0
         for chunk in raw_chunks:
@@ -165,7 +216,7 @@ class PatternRecognitionDecoder:
                 pending -= s
                 yield self._decide(buf)
 
-    def _decide(self, win) -> Command:
+    def _decide(self, win: np.ndarray) -> Command:
         f = td_features(win, self.thresh)[None]
         proba = self.model.predict_proba(f)[0]
         cls = int(self.model.classes_[proba.argmax()])
@@ -175,8 +226,7 @@ class PatternRecognitionDecoder:
         speed = np.clip((mav - self.rest_mav) / (self.mvc_mav - self.rest_mav + 1e-12), 0, 1)
         if voted == 0 or speed == 0:
             return Command("rest", 0.0, float(proba.max()))
-        return Command(GESTURES[voted] if voted < len(GESTURES) else str(voted),
-                       float(speed), n / len(self._votes))
+        return Command(gesture_name(voted), float(speed), n / len(self._votes))
 
 
 # --------------------------------------------------------------------------- #
@@ -186,8 +236,9 @@ class DirectControl:
     """Flexor -> close, extensor -> open, co-contraction -> next grip pattern."""
 
     GRIPS = ["power", "tripod", "pinch", "point", "key"]
+    ENVELOPE_CUTOFF_HZ = 3.0
 
-    def __init__(self, fs, on_thresh=0.15, cocon_ms=150, refractory_ms=600):
+    def __init__(self, fs: float, on_thresh: float = 0.15, cocon_ms: int = 150, refractory_ms: int = 600):
         self.fs = fs
         self.on = on_thresh
         self.cocon_n = int(cocon_ms / 1000 * fs)
@@ -195,19 +246,20 @@ class DirectControl:
         self.grip = 0
         self._cocon = 0
         self._refr = 0
-        self.lp = signal.butter(2, 3, fs=fs, output="sos")  # envelope low-pass
+        self.lp = signal.butter(2, self.ENVELOPE_CUTOFF_HZ, fs=fs, output="sos")  # envelope low-pass
         self.zi = np.zeros((1, 2, 2))
         self.mvc = np.ones(2)
 
-    def calibrate(self, mvc_envelope: np.ndarray):
+    def calibrate(self, mvc_envelope: np.ndarray) -> None:
         """mvc_envelope: (n, 2) envelope recorded during max voluntary contractions."""
         self.mvc = np.percentile(mvc_envelope, 95, axis=0)
 
-    def envelope(self, x_filt):
+    def envelope(self, x_filt: np.ndarray) -> np.ndarray:
+        """Rectify + low-pass, normalised to MVC and clipped to [0, 1]. Stateful."""
         env, self.zi = signal.sosfilt(self.lp, np.abs(x_filt), axis=0, zi=self.zi)
         return np.clip(env / self.mvc, 0, 1)
 
-    def step(self, e_flex, e_ext):
+    def step(self, e_flex: float, e_ext: float) -> tuple[str, float]:
         """One sample of normalised envelope -> (grip, velocity in [-1, 1])."""
         if self._refr:
             self._refr -= 1
@@ -226,9 +278,18 @@ class DirectControl:
 # --------------------------------------------------------------------------- #
 # Synthetic data (for testing without hardware)
 # --------------------------------------------------------------------------- #
-def synthesize(fs=2000, n_ch=8, reps=6, hold_s=3.0, rest_s=2.0, mains=50.0, seed=0):
+def synthesize(
+    fs: float = DEFAULT_FS,
+    n_ch: int = 8,
+    reps: int = 6,
+    hold_s: float = 3.0,
+    rest_s: float = 2.0,
+    mains: float = DEFAULT_MAINS,
+    seed: int = 0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Band-limited noise amplitude-modulated per gesture-specific channel pattern,
-    plus mains hum, low-frequency motion artefact and per-repetition variability."""
+    plus mains hum, low-frequency motion artefact and per-repetition variability.
+    Returns (x (n, n_ch), labels (n,), reps (n,))."""
     rng = np.random.default_rng(seed)
     n_g = len(GESTURES)
     patterns = rng.uniform(0.05, 1.0, (n_g, n_ch)) ** 2
@@ -257,17 +318,27 @@ def synthesize(fs=2000, n_ch=8, reps=6, hold_s=3.0, rest_s=2.0, mains=50.0, seed
 # --------------------------------------------------------------------------- #
 # Evaluation
 # --------------------------------------------------------------------------- #
-def evaluate(x, labels, reps, fs, mains=50.0):
-    """Leave-repetitions-out: train on early reps, test on the last ones.
-    Never split overlapping windows randomly — neighbours leak into the test set
-    and inflate accuracy by 10-20 points."""
+def split_by_rep(reps: np.ndarray, n_test: int = N_TEST_REPS) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Leave-repetitions-out masks: (train_mask, test_mask, test_rep_ids).
+
+    The last `n_test` repetition ids are held out. Never split overlapping
+    windows randomly — neighbours leak into the test set and inflate accuracy
+    by 10-20 points."""
+    test_reps = np.unique(reps)[-n_test:]
+    te = np.isin(reps, test_reps)
+    return ~te, te, test_reps
+
+
+def evaluate(
+    x: np.ndarray, labels: np.ndarray, reps: np.ndarray, fs: float, mains: float = DEFAULT_MAINS
+) -> PatternRecognitionDecoder:
+    """Train on early reps, test on the last ones; print a report and return the fitted decoder."""
     xf = preprocess(x, fs, mains)
-    test_reps = np.unique(reps)[-2:]
-    tr, te = ~np.isin(reps, test_reps), np.isin(reps, test_reps)
+    tr, te, test_reps = split_by_rep(reps)
     dec = PatternRecognitionDecoder(fs, x.shape[1], mains).fit(xf[tr], labels[tr])
     _, y_te, _ = extract(xf[te], fs, labels[te], None, dec.win_ms, dec.step_ms)
     pred = dec.predict_windows(xf[te])
-    names = [GESTURES[i] if i < len(GESTURES) else str(i) for i in np.unique(y_te)]
+    names = [gesture_name(i) for i in np.unique(y_te)]
     print(f"Train reps {np.setdiff1d(np.unique(reps), test_reps).tolist()}, test reps {test_reps.tolist()}")
     print(classification_report(y_te, pred, target_names=names, digits=3))
     print("Confusion matrix (rows=true):\n", confusion_matrix(y_te, pred))
@@ -280,12 +351,14 @@ def evaluate(x, labels, reps, fs, mains=50.0):
     return dec
 
 
-def demo_stream(dec, x, labels, fs, chunk_ms=10):
+def demo_stream(
+    dec: PatternRecognitionDecoder, x: np.ndarray, labels: np.ndarray, fs: float, chunk_ms: int = 10
+) -> None:
     """Replay a recording through the causal online path, as on the device."""
-    n = int(fs * chunk_ms / 1000)
+    n = samples(fs, chunk_ms)
     chunks = (x[i : i + n] for i in range(0, len(x) - n + 1, n))
-    step = int(fs * dec.step_ms / 1000)
-    w = int(fs * dec.win_ms / 1000)
+    step = samples(fs, dec.step_ms)
+    w = samples(fs, dec.win_ms)
     hits = total = 0
     print("\nOnline replay (every 20th decision):")
     for k, cmd in enumerate(dec.stream(chunks)):
@@ -299,7 +372,7 @@ def demo_stream(dec, x, labels, fs, chunk_ms=10):
           f"(includes transition lag from vote smoothing)")
 
 
-def demo_direct(fs=1000, seed=1):
+def demo_direct(fs: float = 1000, seed: int = 1) -> None:
     """Two-site control: close, open, co-contract to switch grip."""
     rng = np.random.default_rng(seed)
     bp = signal.butter(4, [30, 300], btype="band", fs=fs, output="sos")
@@ -320,43 +393,70 @@ def demo_direct(fs=1000, seed=1):
         t0 += int(d * fs)
 
 
-def load_csv(path):
-    import csv
+# --------------------------------------------------------------------------- #
+# I/O and CLI
+# --------------------------------------------------------------------------- #
+NON_CHANNEL_COLUMNS = ("label", "rep", "time", "timestamp")
+
+
+def load_csv(path: str) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None]:
+    """Read a recording CSV -> (x (n, n_ch), labels or None, reps or None).
+
+    Header names are matched case-insensitively; every column not in
+    NON_CHANNEL_COLUMNS is treated as an EMG channel."""
     with open(path) as fh:
         header = next(csv.reader(fh))
     data = np.genfromtxt(path, delimiter=",", skip_header=1)
     cols = {h.strip().lower(): i for i, h in enumerate(header)}
     lab = data[:, cols["label"]].astype(int) if "label" in cols else None
     rep = data[:, cols["rep"]].astype(int) if "rep" in cols else None
-    ch = [i for h, i in cols.items() if h not in ("label", "rep", "time", "timestamp")]
+    ch = [i for h, i in cols.items() if h not in NON_CHANNEL_COLUMNS]
     return data[:, ch], lab, rep
 
 
-def main():
+def contiguous_reps(n: int, n_reps: int = 5) -> np.ndarray:
+    """Fallback repetition index when a CSV has no `rep` column: contiguous fifths."""
+    return np.minimum(np.arange(n) * n_reps // n, n_reps - 1)
+
+
+def run_csv(path: str, fs: float, mains: float) -> None:
+    """Evaluate a recorded CSV, or print signal statistics when it has no labels."""
+    x, lab, rep = load_csv(path)
+    if lab is None:
+        xf = preprocess(x, fs, mains)
+        print("No labels: per-channel RMS", np.round(np.sqrt((xf**2).mean(0)), 4))
+        print("Mean frequency (Hz):", np.round(mean_frequency(xf, fs), 1))
+        return
+    if rep is None:
+        rep = contiguous_reps(len(x))
+    dec = evaluate(x, lab, rep, fs, mains)
+    demo_stream(dec, x[rep == rep.max()], lab[rep == rep.max()], fs)
+
+
+def run_demo(fs: float, mains: float) -> None:
+    """Synthetic end-to-end run: offline evaluation, causal replay, two-site control."""
+    x, lab, rep = synthesize(fs=fs, mains=mains)
+    print(f"Synthetic: {x.shape[1]} channels, {len(x) / fs:.0f}s, {len(GESTURES)} classes\n")
+    dec = evaluate(x, lab, rep, fs, mains)
+    demo_stream(dec, x[rep == rep.max()], lab[rep == rep.max()], fs)
+    demo_direct()
+
+
+def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--demo", action="store_true")
     ap.add_argument("--csv")
-    ap.add_argument("--fs", type=float, default=2000)
-    ap.add_argument("--mains", type=float, default=50.0, help="50 (India/EU) or 60 (US)")
-    a = ap.parse_args()
+    ap.add_argument("--fs", type=float, default=DEFAULT_FS)
+    ap.add_argument("--mains", type=float, default=DEFAULT_MAINS, help="50 (India/EU) or 60 (US)")
+    return ap
 
+
+def main(argv: list[str] | None = None) -> None:
+    a = build_parser().parse_args(argv)
     if a.csv:
-        x, lab, rep = load_csv(a.csv)
-        if lab is None:
-            xf = preprocess(x, a.fs, a.mains)
-            print("No labels: per-channel RMS", np.round(np.sqrt((xf**2).mean(0)), 4))
-            print("Mean frequency (Hz):", np.round(mean_frequency(xf, a.fs), 1))
-            return
-        if rep is None:  # fall back to contiguous fifths
-            rep = np.minimum(np.arange(len(x)) * 5 // len(x), 4)
-        dec = evaluate(x, lab, rep, a.fs, a.mains)
-        demo_stream(dec, x[rep == rep.max()], lab[rep == rep.max()], a.fs)
+        run_csv(a.csv, a.fs, a.mains)
     else:
-        x, lab, rep = synthesize(fs=a.fs, mains=a.mains)
-        print(f"Synthetic: {x.shape[1]} channels, {len(x) / a.fs:.0f}s, {len(GESTURES)} classes\n")
-        dec = evaluate(x, lab, rep, a.fs, a.mains)
-        demo_stream(dec, x[rep == rep.max()], lab[rep == rep.max()], a.fs)
-        demo_direct()
+        run_demo(a.fs, a.mains)
 
 
 if __name__ == "__main__":

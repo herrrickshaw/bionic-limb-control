@@ -1,0 +1,20 @@
+[project]
+name = "bionic-limb-control"
+version = "0.1.0"
+description = "Surface-EMG decoding for prosthetic-hand control: filtering, Hudgins features, LDA, direct two-site control"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["numpy", "scipy", "scikit-learn"]
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
