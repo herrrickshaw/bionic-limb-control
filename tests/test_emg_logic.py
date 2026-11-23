@@ -157,6 +157,14 @@ class TestFeatures:
         mf = ed.mean_frequency(np.sin(2 * np.pi * 100 * t)[:, None], fs)
         assert mf.shape == (1,) and 50 < mf[0] < 150
 
+    def test_mean_frequency_short_window_emits_no_warning(self):
+        import warnings
+        fs = 1000
+        t = np.arange(100) / fs
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")      # scipy warns when nperseg exceeds the window length
+            ed.mean_frequency(np.sin(2 * np.pi * 100 * t)[:, None], fs)
+
     def test_sliding_windows_boundaries(self):
         assert list(ed.sliding_windows(199, 1000)) == []
         assert list(ed.sliding_windows(200, 1000)) == [(0, 200)]
@@ -214,6 +222,22 @@ class TestDecoder:
         assert dec.fit(xf, y) is dec
         assert dec.thresh == pytest.approx(3 * np.std(xf[y == 0]))
         assert 0 <= dec.rest_mav < dec.mvc_mav
+
+    def test_fit_calibrates_with_95th_percentile_of_window_mav(self):
+        fs, n_ch = 1000, 2
+        t = np.arange(4000) / fs
+        rest = 0.01 * (1 + 4 * t / t[-1])[:, None] * np.sin(2 * np.pi * 80 * t)[:, None] * np.ones(n_ch)
+        act = 0.5 * (1 + t / t[-1])[:, None] * np.sin(2 * np.pi * 120 * t)[:, None] * np.ones(n_ch)
+        x = np.vstack([rest, act])
+        y = np.r_[np.zeros(len(rest), dtype=int), np.ones(len(act), dtype=int)]
+        dec = ed.PatternRecognitionDecoder(fs, n_ch)
+        dec.model = SimpleNamespace(fit=lambda X, y_: None)
+        dec.fit(x, y)
+        X, yw, _ = ed.extract(x, fs, y, None, dec.win_ms, dec.step_ms, dec.thresh)
+        mav = X[:, :n_ch].mean(1)
+        assert dec.rest_mav == pytest.approx(np.percentile(mav[yw == 0], 95))
+        assert dec.rest_mav > np.percentile(mav[yw == 0], 80)       # a lower percentile would fail here
+        assert dec.mvc_mav == pytest.approx(np.percentile(mav[yw != 0], 95))
 
     def test_fit_without_rest_uses_default_threshold(self):
         x, y, r = ed.synthesize(fs=1000, n_ch=2, reps=2, hold_s=1.0, rest_s=0.5)
